@@ -47,6 +47,15 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
+// elementwise ops are nice and ez
+__global__ void residual_forward_kernel_coarsed(float* out, float* inp1, float* inp2, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int idx = i; idx<N; idx+=stride) {
+        out[idx] = inp1[idx] + inp2[idx];
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -56,16 +65,26 @@ void residual_forward1(float* out, float* inp1, float* inp2, int N, const int bl
     cudaCheck(cudaGetLastError());
 }
 
+void residual_forward_coarsed(float* out, float* inp1, float* inp2, int N, const int block_size, const int coarse_factor) {
+    const int grid_size = CEIL_DIV(N, block_size * coarse_factor);
+    residual_forward_kernel_coarsed<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void residual_forward(int kernel_num,
                   float* out,
                   float* inp1,
                   float* inp2,
                   int N,
-                  int block_size) {
+                  int block_size,
+                  int coarse_factor=2) {
     switch (kernel_num) {
         case 1:
             residual_forward1(out, inp1, inp2, N, block_size);
+            break;
+        case 2:
+            residual_forward_coarsed(out, inp1, inp2, N, block_size, coarse_factor);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -113,14 +132,22 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
+    int coarse_factor = 2;
+    int repeat_times = 1000;
     if (argc > 1) {
         kernel_num = atoi(argv[1]);
+    }
+    if (argc > 2) {
+        coarse_factor = atoi(argv[2]);
+    }
+    if (argc > 3) {
+        repeat_times = atoi(argv[3]);
     }
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
     residual_forward_cpu(out, inp1, inp2, B * T * C);
-    residual_forward(kernel_num, d_out, d_inp1, d_inp2, B * T * C, 256);
+    residual_forward(kernel_num, d_out, d_inp1, d_inp2, B * T * C, 256, coarse_factor);
     float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
@@ -142,7 +169,6 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 1000;
         cudaEvent_t start, stop;
         cudaCheck(cudaEventCreate(&start));
         cudaCheck(cudaEventCreate(&stop));

@@ -61,6 +61,28 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
     }
 }
 
+__global__ void gelu_kernel_coarsed(float* out, const float* inp, int N, int coarse_factor) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * coarse_factor;
+    float s = sqrtf(2.0f / M_PI);
+    for (int j=i; j<i+coarse_factor; j++) {
+        if (j<N) {
+            float xi = inp[j];
+            float cube = 0.044715f * xi * xi * xi;
+            out[j] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
+        }
+    }
+}
+
+__global__ void gelu_kernel_coarsed_coalesced(float* out, const float* inp, int N, int coarse_factor) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int j = i; j<N; j+=stride) {
+        float s = sqrtf(2.0f / M_PI);
+        float xi = inp[j];
+        float cube = 0.044715f * xi * xi * xi;
+        out[j] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
+    }
+}
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -70,15 +92,32 @@ void gelu_forward1(float* out, float* inp, int N, const int block_size) {
     cudaCheck(cudaGetLastError());
 }
 
+void gelu_forward_coarsed(float* out, float* inp, int N, const int block_size, const int coarse_factor) {
+    const int grid_size = CEIL_DIV(N, block_size * coarse_factor);
+    gelu_kernel_coarsed<<<grid_size, block_size>>>(out, inp, N, coarse_factor);
+    cudaCheck(cudaGetLastError());
+}
+void gelu_forward_coarsed_coal(float* out, float* inp, int N, const int block_size, const int coarse_factor) {
+    const int grid_size = CEIL_DIV(N, block_size * coarse_factor);
+    gelu_kernel_coarsed_coalesced<<<grid_size, block_size>>>(out, inp, N, coarse_factor);
+    cudaCheck(cudaGetLastError());
+}
 // kernel version dispatch
 void gelu_forward(int kernel_num,
                   float* out,
                   float* inp,
                   int B, int T, int C,
-                  int block_size) {
+                  int block_size,
+                  int coarse_factor=2) {
     switch (kernel_num) {
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
+            break;
+        case 2:
+            gelu_forward_coarsed(out, inp, B * T * C, block_size, coarse_factor);
+            break;
+        case 3:
+            gelu_forward_coarsed_coal(out, inp, B * T * C, block_size, coarse_factor);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -122,14 +161,22 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
+    int coarse_factor = 2;
+    int repeat_times = 1000;
     if (argc > 1) {
         kernel_num = atoi(argv[1]);
+    }
+    if (argc > 2) {
+        coarse_factor = atoi(argv[2]);
+    }
+    if (argc > 3) {
+        repeat_times = atoi(argv[3]);
     }
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
     gelu_forward_cpu(out, inp, B * T * C);
-    gelu_forward(kernel_num, d_out, d_inp, B, T, C, 128);
+    gelu_forward(kernel_num, d_out, d_inp, B, T, C, 128, coarse_factor);
     float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
@@ -146,32 +193,31 @@ int main(int argc, char **argv) {
     printf("Results match!\n");
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    
+for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+    int block_size = block_sizes[j];
 
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
+    cudaEvent_t start, stop;
+    cudaCheck(cudaEventCreate(&start));
+    cudaCheck(cudaEventCreate(&stop));
+    cudaCheck(cudaEventRecord(start, 0));
+    for (int i = 0; i < repeat_times; i++) {
+        gelu_forward(kernel_num, d_out, d_inp, B, T, C, block_size, coarse_factor);
+    }
+    cudaCheck(cudaEventRecord(stop, 0));
+    cudaCheck(cudaEventSynchronize(start));
+    cudaCheck(cudaEventSynchronize(stop));
+    float elapsed_time;
+    cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
 
-        int repeat_times = 1000;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            gelu_forward(kernel_num, d_out, d_inp, B, T, C, block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+    // napkin math: estimate the memory bandwidth achieved
+    // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
+    // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
+   long memory_ops = B * T * C * 2 * 4;
+    float memory_bandwidth = memory_ops / (elapsed_time / repeat_times) / 1e6;
 
-        // napkin math: estimate the memory bandwidth achieved
-        // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
-        // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 2 * 4;
-        float memory_bandwidth = memory_ops / (elapsed_time / repeat_times) / 1e6;
-
-        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time / repeat_times, memory_bandwidth);
+    printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time / repeat_times, memory_bandwidth);
     }
 
     // free memory
