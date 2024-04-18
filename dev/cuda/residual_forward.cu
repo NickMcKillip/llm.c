@@ -1,17 +1,8 @@
-/*
-Kernels for residual forward pass.
-
-Compile example:
-nvcc -O3 --use_fast_math residual_forward.cu -o residual_forward
-
-version 1 is naive port from CPU code to kernel
-./residual_forward 1
-*/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include "common.h"
+#include <iostream>
 
 // ----------------------------------------------------------------------------
 // CPU code reference lol
@@ -33,6 +24,55 @@ __global__ void residual_forward_kernel(float* out, const float* inp1, const flo
     }
 }
 
+// https://developer.nvidia.com/blog/cuda-pro-tip-write-flexible-kernels-grid-stride-loops/
+__global__ void residual_forward_kernel_2(float* out, const float* inp1, const float* inp2, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int idx = i; idx<N; idx+=stride) {
+        out[idx] = inp1[idx] + inp2[idx];
+    }
+}
+
+// https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
+__global__ void residual_forward_kernel_3(float* out, float* inp1, float* inp2, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N/2) {
+        float2 inp1_r;
+        float2 inp2_r;
+        inp1_r = reinterpret_cast<float2*>(inp1)[idx];
+        inp2_r = reinterpret_cast<float2*>(inp2)[idx];
+        inp1_r.x = inp1_r.x + inp2_r.x;
+        inp1_r.y = inp1_r.y + inp2_r.y;
+        reinterpret_cast<float2*>(out)[idx] = inp1_r;
+    } else if (idx==N/2 && N%2==1) {
+        out[N-1] = inp1[N-1] + inp2[N-1];
+    }
+}
+
+__global__ void residual_forward_kernel_4(float* out, float* inp1, float* inp2, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N/4) {
+        float4 inp1_r;
+        float4 inp2_r;
+        inp1_r = reinterpret_cast<float4*>(inp1)[idx];
+        inp2_r = reinterpret_cast<float4*>(inp2)[idx];
+        inp1_r.x = inp1_r.x + inp2_r.x;
+        inp1_r.y = inp1_r.y + inp2_r.y;
+        inp1_r.z = inp1_r.z + inp2_r.z;
+        inp1_r.w = inp1_r.w + inp2_r.w;
+        reinterpret_cast<float4*>(out)[idx] = inp1_r;
+        return;
+    }
+    if (idx == N/4) {
+        int remainder = N%4;
+        while (remainder) {
+            int i = N - remainder;
+            out[i] = inp1[i] + inp2[i];
+            remainder--;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -42,16 +82,43 @@ void residual_forward1(float* out, const float* inp1, const float* inp2, int N, 
     cudaCheck(cudaGetLastError());
 }
 
+void residual_forward2(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
+    residual_forward_kernel_2<<<1200, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void residual_forward3(float* out, float* inp1, float* inp2, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size*2);
+    residual_forward_kernel_3<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void residual_forward4(float* out, float* inp1, float* inp2, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size*4);
+    residual_forward_kernel_4<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+
 // kernel version dispatch
 void residual_forward(int kernel_num,
                   float* out,
-                  const float* inp1,
-                  const float* inp2,
+                  float* inp1,
+                  float* inp2,
                   int N,
                   int block_size) {
     switch (kernel_num) {
         case 1:
             residual_forward1(out, inp1, inp2, N, block_size);
+            break;
+        case 2:
+            residual_forward2(out, inp1, inp2, N, block_size);
+            break;
+        case 3:
+            residual_forward3(out, inp1, inp2, N, block_size);
+            break;
+        case 4:
+            residual_forward4(out, inp1, inp2, N, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -88,8 +155,12 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
+    int repeat_times = 1000;
     if (argc > 1) {
         kernel_num = atoi(argv[1]);
+    }
+    if (argc > 2) {
+        repeat_times = atoi(argv[2]);
     }
     printf("Using kernel %d\n", kernel_num);
 
@@ -112,7 +183,6 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, residual_forward,
                                               kernel_num, d_out, d_inp1, d_inp2, B * T * C, block_size
                                               );
